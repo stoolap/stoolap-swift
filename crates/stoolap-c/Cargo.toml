@@ -1,0 +1,31 @@
+[package]
+name = "stoolap-c"
+version = "0.4.0"
+edition = "2021"
+authors = ["Stoolap Contributors"]
+license = "Apache-2.0"
+description = "cdylib shim that re-exports the official stoolap::ffi cursor API for the Swift driver"
+publish = false
+
+[lib]
+name = "stoolap_c"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+# We pull in stoolap with the `ffi` feature so its #[no_mangle] cursor API
+# (stoolap_open, stoolap_query, stoolap_rows_next, stoolap_rows_column_*, ...)
+# is linked into our cdylib. The Swift side calls these directly via
+# the C interop module CStoolap. No custom wrapper code is needed.
+stoolap = { git = "https://github.com/stoolap/stoolap.git", branch = "main", default-features = false, features = ["ffi", "parallel"] }
+
+[profile.release]
+# Mirrors stoolap's `profile.max`: opt-level=3 for speed (not size),
+# fat LTO, single codegen unit, no debug info, panic=abort.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 0
+strip = "symbols"
+overflow-checks = false
+incremental = false

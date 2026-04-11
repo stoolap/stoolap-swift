@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  STOOLAP_ENGINE_REF: v0.4.0
+
+jobs:
+  build-lib:
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            lib_file: libstoolap_c.dylib
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            lib_file: libstoolap_c.dylib
+
+    name: Build Rust - ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone stoolap engine
+        run: git clone --depth 1 --branch ${{ env.STOOLAP_ENGINE_REF }} https://github.com/stoolap/stoolap.git stoolap-engine
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/stoolap-c
+          key: ${{ matrix.settings.target }}
+
+      - name: Build stoolap-c
+        working-directory: crates/stoolap-c
+        run: cargo build --release --target ${{ matrix.settings.target }}
+
+      - name: Fix macOS install name
+        run: install_name_tool -id @rpath/libstoolap_c.dylib crates/stoolap-c/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+
+      - name: Strip shared library
+        run: strip -x crates/stoolap-c/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+
+      - name: Upload shared library
+        uses: actions/upload-artifact@v4
+        with:
+          name: lib-${{ matrix.settings.target }}
+          path: crates/stoolap-c/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+          if-no-files-found: error
+
+  test:
+    name: Test - Swift ${{ matrix.swift }} (macOS)
+    needs: build-lib
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        swift: ['5.9', '5.10', '6.0']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: ${{ matrix.swift }}
+
+      - name: Download shared library
+        uses: actions/download-artifact@v4
+        with:
+          name: lib-aarch64-apple-darwin
+          path: lib
+
+      - name: Configure library path
+        run: |
+          echo "LD_LIBRARY_PATH=${{ github.workspace }}/lib" >> $GITHUB_ENV
+          echo "DYLD_LIBRARY_PATH=${{ github.workspace }}/lib" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=${{ github.workspace }}/lib" >> $GITHUB_ENV
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test

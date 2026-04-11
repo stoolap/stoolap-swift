@@ -1,0 +1,5 @@
+module CStoolap {
+    header "include/stoolap.h"
+    link "stoolap_c"
+    export *
+}

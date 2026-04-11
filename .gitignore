@@ -1,0 +1,38 @@
+# Swift / SPM
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+xcuserdata/
+
+# Rust / cargo
+crates/stoolap-c/target/
+**/*.rs.bk
+Cargo.lock
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Xcode
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Signing
+*.entitlements
+!Sources/**/*.entitlements
