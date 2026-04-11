@@ -16,10 +16,10 @@ jobs:
       fail-fast: true
       matrix:
         settings:
-          - host: macos-latest
+          - host: macos-14
             target: aarch64-apple-darwin
             lib_file: libstoolap_c.dylib
-          - host: macos-latest
+          - host: macos-14
             target: x86_64-apple-darwin
             lib_file: libstoolap_c.dylib
 
@@ -61,14 +61,20 @@ jobs:
           if-no-files-found: error
 
   test:
-    name: Test - Swift ${{ matrix.swift }} (macOS)
+    name: Test - Swift ${{ matrix.swift }} (${{ matrix.os }})
     needs: build-lib
-    runs-on: macos-latest
     strategy:
       fail-fast: true
       matrix:
-        swift: ['5.10', '6.0', '6.1']
+        include:
+          - swift: '5.10'
+            os: macos-14
+          - swift: '6.0'
+            os: macos-14
+          - swift: '6.1'
+            os: macos-15
 
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
