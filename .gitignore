@@ -6,6 +6,7 @@ Package.resolved
 *.xcworkspace/
 DerivedData/
 xcuserdata/
+*.xcframework/
 
 # Rust / cargo
 crates/stoolap-c/target/

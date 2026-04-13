@@ -18,10 +18,14 @@ jobs:
         settings:
           - host: macos-14
             target: aarch64-apple-darwin
-            lib_file: libstoolap_c.dylib
           - host: macos-14
             target: x86_64-apple-darwin
-            lib_file: libstoolap_c.dylib
+          - host: macos-14
+            target: aarch64-apple-ios
+          - host: macos-14
+            target: aarch64-apple-ios-sim
+          - host: macos-14
+            target: x86_64-apple-ios
 
     name: Build - ${{ matrix.settings.target }}
     runs-on: ${{ matrix.settings.host }}
@@ -47,17 +51,31 @@ jobs:
         working-directory: crates/stoolap-c
         run: cargo build --release --target ${{ matrix.settings.target }}
 
-      - name: Fix macOS install name
-        run: install_name_tool -id @rpath/libstoolap_c.dylib crates/stoolap-c/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+      - name: Strip static library
+        run: strip -x crates/stoolap-c/target/${{ matrix.settings.target }}/release/libstoolap_c.a
 
-      - name: Strip shared library
-        run: strip -x crates/stoolap-c/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
-
-      - name: Upload shared library
+      - name: Upload static library
         uses: actions/upload-artifact@v4
         with:
           name: lib-${{ matrix.settings.target }}
-          path: crates/stoolap-c/target/${{ matrix.settings.target }}/release/${{ matrix.settings.lib_file }}
+          path: crates/stoolap-c/target/${{ matrix.settings.target }}/release/libstoolap_c.a
+          if-no-files-found: error
+
+      # Also upload dylib for macOS targets (used by swift build/test)
+      - name: Fix macOS install name
+        if: contains(matrix.settings.target, 'darwin')
+        run: install_name_tool -id @rpath/libstoolap_c.dylib crates/stoolap-c/target/${{ matrix.settings.target }}/release/libstoolap_c.dylib
+
+      - name: Strip shared library
+        if: contains(matrix.settings.target, 'darwin')
+        run: strip -x crates/stoolap-c/target/${{ matrix.settings.target }}/release/libstoolap_c.dylib
+
+      - name: Upload shared library
+        if: contains(matrix.settings.target, 'darwin')
+        uses: actions/upload-artifact@v4
+        with:
+          name: dylib-${{ matrix.settings.target }}
+          path: crates/stoolap-c/target/${{ matrix.settings.target }}/release/libstoolap_c.dylib
           if-no-files-found: error
 
   test:
@@ -87,7 +105,7 @@ jobs:
       - name: Download shared library
         uses: actions/download-artifact@v4
         with:
-          name: lib-aarch64-apple-darwin
+          name: dylib-aarch64-apple-darwin
           path: lib
 
       - name: Configure library path
@@ -102,9 +120,67 @@ jobs:
       - name: Test
         run: swift test
 
+  xcframework:
+    name: Build XCFramework
+    needs: build-lib
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all static libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lib-*
+          path: libs
+
+      - name: Create fat libraries
+        run: |
+          mkdir -p fat/macos fat/ios-sim
+
+          # macOS universal (arm64 + x86_64)
+          lipo -create \
+            libs/lib-aarch64-apple-darwin/libstoolap_c.a \
+            libs/lib-x86_64-apple-darwin/libstoolap_c.a \
+            -output fat/macos/libstoolap_c.a
+
+          # iOS simulator universal (arm64 + x86_64)
+          lipo -create \
+            libs/lib-aarch64-apple-ios-sim/libstoolap_c.a \
+            libs/lib-x86_64-apple-ios/libstoolap_c.a \
+            -output fat/ios-sim/libstoolap_c.a
+
+      - name: Assemble XCFramework
+        run: |
+          xcodebuild -create-xcframework \
+            -library fat/macos/libstoolap_c.a \
+            -headers Sources/CStoolap/include \
+            -library libs/lib-aarch64-apple-ios/libstoolap_c.a \
+            -headers Sources/CStoolap/include \
+            -library fat/ios-sim/libstoolap_c.a \
+            -headers Sources/CStoolap/include \
+            -output StoolapC.xcframework
+
+      - name: Zip XCFramework
+        run: zip -r StoolapC.xcframework.zip StoolapC.xcframework
+
+      - name: Compute checksum
+        id: checksum
+        run: echo "sha256=$(shasum -a 256 StoolapC.xcframework.zip | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Upload XCFramework artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StoolapC-xcframework
+          path: StoolapC.xcframework.zip
+          if-no-files-found: error
+
+    outputs:
+      checksum: ${{ steps.checksum.outputs.sha256 }}
+
   release:
     name: Create GitHub Release
-    needs: [build-lib, test]
+    needs: [build-lib, test, xcframework]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -112,17 +188,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download aarch64 library
+      - name: Download aarch64 dylib
         uses: actions/download-artifact@v4
         with:
-          name: lib-aarch64-apple-darwin
+          name: dylib-aarch64-apple-darwin
           path: artifacts/aarch64
 
-      - name: Download x86_64 library
+      - name: Download x86_64 dylib
         uses: actions/download-artifact@v4
         with:
-          name: lib-x86_64-apple-darwin
+          name: dylib-x86_64-apple-darwin
           path: artifacts/x86_64
+
+      - name: Download XCFramework
+        uses: actions/download-artifact@v4
+        with:
+          name: StoolapC-xcframework
+          path: artifacts
 
       - name: Prepare release assets
         run: |
@@ -133,6 +215,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          body: |
+            ### XCFramework (iOS + macOS)
+
+            ```
+            SHA-256: ${{ needs.xcframework.outputs.checksum }}
+            ```
+
+            Platforms: macOS (arm64, x86_64), iOS (arm64), iOS Simulator (arm64, x86_64)
           files: |
             artifacts/libstoolap_c-darwin-arm64.dylib
             artifacts/libstoolap_c-darwin-x64.dylib
+            artifacts/StoolapC.xcframework.zip
