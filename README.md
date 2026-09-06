@@ -8,7 +8,7 @@ High-performance Swift driver for [Stoolap](https://stoolap.io) embedded SQL dat
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/stoolap/stoolap-swift.git", from: "0.4.0")
+    .package(url: "https://github.com/stoolap/stoolap-swift.git", from: "0.4.1")
 ]
 ```
 

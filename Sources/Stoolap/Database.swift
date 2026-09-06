@@ -58,7 +58,7 @@ public final class Database: @unchecked Sendable {
         _ = stoolap_close(handle)
     }
 
-    /// Returns the underlying Rust crate version (e.g. "0.4.0").
+    /// Returns the underlying Rust crate version (e.g. "0.4.1").
     public static var version: String {
         if let cstr = stoolap_version() {
             return String(cString: cstr)
