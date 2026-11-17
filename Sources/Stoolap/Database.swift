@@ -25,6 +25,10 @@ public final class Database: @unchecked Sendable {
     @usableFromInline
     let handle: OpaquePointer
 
+    /// Serializes calls on `handle`, which keeps the last error: two
+    /// threads sharing a `Database` would otherwise race on it.
+    let lock = HandleLock()
+
     private init(handle: OpaquePointer) {
         self.handle = handle
     }
@@ -58,7 +62,7 @@ public final class Database: @unchecked Sendable {
         _ = stoolap_close(handle)
     }
 
-    /// Returns the underlying Rust crate version (e.g. "0.4.2").
+    /// Returns the underlying Rust crate version (e.g. "0.5.0").
     public static var version: String {
         if let cstr = stoolap_version() {
             return String(cString: cstr)
@@ -82,26 +86,26 @@ public final class Database: @unchecked Sendable {
     /// Execute a single DDL/DML statement. Returns rows affected.
     @discardableResult
     public func execute(_ sql: String, _ params: [Value] = []) throws -> Int64 {
-        var affected: Int64 = 0
-        let rc = try sql.withCString { sqlPtr -> Int32 in
+        try sql.withCString { sqlPtr in
             try ParameterBinder.withBound(params) { ptr, len in
-                stoolap_exec_params(handle, sqlPtr, ptr, len, &affected)
+                try lock.withLock {
+                    var affected: Int64 = 0
+                    if stoolap_exec_params(handle, sqlPtr, ptr, len, &affected) != STOOLAP_OK {
+                        throw StoolapError.from(db: handle)
+                    }
+                    return affected
+                }
             }
         }
-        if rc != STOOLAP_OK {
-            throw StoolapError.from(db: handle)
-        }
-        return affected
     }
 
     /// Execute one or more semicolon-separated DDL/DML statements with no
-    /// parameters. Useful for schema setup.
+    /// parameters. Useful for schema setup. The engine parses the whole
+    /// script, including quotes and comments, before running it: a parse
+    /// error runs nothing, while after a runtime error the statements
+    /// before the failing one stay applied.
     public func exec(_ sql: String) throws {
-        for stmt in Self.splitStatements(sql) {
-            let trimmed = stmt.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
-            _ = try execute(trimmed)
-        }
+        _ = try execute(sql)
     }
 
     // ---- Query ----
@@ -143,26 +147,31 @@ public final class Database: @unchecked Sendable {
 
     @inline(__always)
     private func openCursor(sql: String, params: [Value]) throws -> OpaquePointer {
-        var raw: OpaquePointer?
-        let rc = try sql.withCString { sqlPtr -> Int32 in
+        try sql.withCString { sqlPtr in
             try ParameterBinder.withBound(params) { ptr, len in
-                stoolap_query_params(handle, sqlPtr, ptr, len, &raw)
+                try lock.withLock {
+                    var raw: OpaquePointer?
+                    let rc = stoolap_query_params(handle, sqlPtr, ptr, len, &raw)
+                    guard rc == STOOLAP_OK, let raw = raw else {
+                        throw StoolapError.from(db: handle)
+                    }
+                    return raw
+                }
             }
         }
-        guard rc == STOOLAP_OK, let raw = raw else {
-            throw StoolapError.from(db: handle)
-        }
-        return raw
     }
 
     // ---- Transactions ----
 
     /// Begin a transaction.
     public func begin() throws -> Transaction {
-        var raw: OpaquePointer?
-        let rc = stoolap_begin(handle, &raw)
-        guard rc == STOOLAP_OK, let raw = raw else {
-            throw StoolapError.from(db: handle)
+        let raw = try lock.withLock { () throws -> OpaquePointer in
+            var raw: OpaquePointer?
+            let rc = stoolap_begin(handle, &raw)
+            guard rc == STOOLAP_OK, let raw = raw else {
+                throw StoolapError.from(db: handle)
+            }
+            return raw
         }
         return Transaction(handle: raw)
     }
@@ -185,10 +194,15 @@ public final class Database: @unchecked Sendable {
 
     /// Parse a SQL statement once and reuse the cached plan.
     public func prepare(_ sql: String) throws -> PreparedStatement {
-        var raw: OpaquePointer?
-        let rc = sql.withCString { stoolap_prepare(handle, $0, &raw) }
-        guard rc == STOOLAP_OK, let raw = raw else {
-            throw StoolapError.from(db: handle)
+        let raw = try sql.withCString { sqlPtr in
+            try lock.withLock { () throws -> OpaquePointer in
+                var raw: OpaquePointer?
+                let rc = stoolap_prepare(handle, sqlPtr, &raw)
+                guard rc == STOOLAP_OK, let raw = raw else {
+                    throw StoolapError.from(db: handle)
+                }
+                return raw
+            }
         }
         let stmt = PreparedStatement(handle: raw)
         // Hold a strong back-reference so executeBatch can begin a tx on
@@ -196,79 +210,5 @@ public final class Database: @unchecked Sendable {
         // is safe to share.
         stmt.ownerDatabase = self
         return stmt
-    }
-
-    // ---- Helpers ----
-
-    /// Pure-Swift SQL splitter. Handles single/double quoted strings,
-    /// `--` line comments, and `/* */` block comments. Used by `exec()`
-    /// so users can pass multi-statement schema scripts in a single call.
-    @usableFromInline
-    static func splitStatements(_ input: String) -> [String] {
-        var result = [String]()
-        var current = ""
-        var inSingle = false
-        var inDouble = false
-        var inLineComment = false
-        var inBlockComment = false
-
-        let chars = Array(input)
-        var i = 0
-        while i < chars.count {
-            let c = chars[i]
-
-            if inLineComment {
-                if c == "\n" {
-                    inLineComment = false
-                    current.append(c)
-                }
-                i += 1
-                continue
-            }
-
-            if !inSingle, !inDouble, !inBlockComment, c == "-",
-               i + 1 < chars.count, chars[i + 1] == "-"
-            {
-                inLineComment = true
-                i += 2
-                continue
-            }
-
-            if inBlockComment {
-                if c == "*", i + 1 < chars.count, chars[i + 1] == "/" {
-                    inBlockComment = false
-                    i += 2
-                    continue
-                }
-                i += 1
-                continue
-            }
-
-            if !inSingle, !inDouble, c == "/", i + 1 < chars.count, chars[i + 1] == "*" {
-                inBlockComment = true
-                i += 2
-                continue
-            }
-
-            if !inBlockComment, !inLineComment {
-                if c == "'", i == 0 || chars[i - 1] != "\\" {
-                    inSingle.toggle()
-                } else if c == "\"", i == 0 || chars[i - 1] != "\\" {
-                    inDouble.toggle()
-                }
-            }
-
-            if c == ";", !inSingle, !inDouble, !inBlockComment, !inLineComment {
-                result.append(current)
-                current = ""
-            } else {
-                current.append(c)
-            }
-            i += 1
-        }
-        if !current.isEmpty {
-            result.append(current)
-        }
-        return result
     }
 }

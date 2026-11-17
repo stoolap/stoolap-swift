@@ -252,12 +252,20 @@ const uint8_t* stoolap_rows_column_blob(const StoolapRows* rows, int32_t index, 
 int64_t        stoolap_rows_affected(const StoolapRows* rows);
 const char*    stoolap_rows_errmsg(const StoolapRows* rows);
 
-/* Optional bulk path: dump every remaining row into a heap-allocated
- * binary buffer. Caller must free with stoolap_buffer_free. The Swift
- * driver does NOT use this path — the cursor functions above are
- * faster for typical workloads. */
+/* Bulk path: dump every remaining row into a heap-allocated binary
+ * buffer. Caller must free with stoolap_buffer_free. */
 int32_t        stoolap_rows_fetch_all(StoolapRows* rows, uint8_t** out_buf, int64_t* out_len);
 void           stoolap_buffer_free(uint8_t* buf, int64_t len);
+
+/* Pack up to max_rows of the remaining rows in the fetch_all format and
+ * advance the cursor. *out_rows == 0 means the result is exhausted. The
+ * buffer belongs to the rows handle: valid until the next call on it or
+ * stoolap_rows_close; must NOT be freed. */
+int32_t        stoolap_rows_fetch_chunk(StoolapRows* rows,
+                                        int32_t max_rows,
+                                        const uint8_t** out_buf,
+                                        int64_t* out_len,
+                                        int32_t* out_rows);
 
 #ifdef __cplusplus
 }
