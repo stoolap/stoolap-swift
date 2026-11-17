@@ -8,13 +8,11 @@ High-performance Swift driver for [Stoolap](https://stoolap.io) embedded SQL dat
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/stoolap/stoolap-swift.git", from: "0.4.2")
+    .package(url: "https://github.com/stoolap/stoolap-swift.git", from: "0.5.0")
 ]
 ```
 
-Requires:
-- macOS 12+ or iOS 15+
-- The `libstoolap_c` shared library (see [Building from Source](#building-from-source))
+Requires macOS 12+ or iOS 15+. The package links `StoolapC.xcframework`, the engine built as a static library for macOS and iOS, which Swift Package Manager downloads from the release. No Rust toolchain is needed.
 
 ## Quick Start
 
@@ -245,7 +243,7 @@ do {
 
 ## Async API
 
-`AsyncDatabase` wraps `Database` with Swift concurrency. All calls hop to a detached task so they do not block the cooperative thread pool.
+`AsyncDatabase` wraps `Database` with Swift concurrency. Each call runs the synchronous engine call in a detached task, off the calling actor. The task still occupies a thread of the cooperative pool while the engine works.
 
 ```swift
 import Stoolap
@@ -297,9 +295,9 @@ do {
 | `.text(String)` | `TEXT` | UTF-8 encoded |
 | `.boolean(Bool)` | `BOOLEAN` | |
 | `.null` | `NULL` | Any type |
-| `.timestamp(Date)` | `TIMESTAMP` | Nanosecond precision |
+| `.timestamp(Date)` | `TIMESTAMP` | Stored in nanoseconds; `Date` holds about 0.1 µs at current dates, years 1677-2262 |
 | `.json(String)` | `JSON` | Pre-serialized JSON string |
-| `.blob(Data)` | `BLOB` | Raw bytes |
+| `.blob(Data)` | `VECTOR` | Packed little-endian f32 bytes (length a multiple of 4); reads back as `.vector` |
 | `.vector([Float])` | `VECTOR` | Packed f32 array for similarity search |
 
 ## Architecture
@@ -310,9 +308,11 @@ The driver uses three read strategies depending on the query:
 |--------|----------|----------|
 | `query()`, `queryRaw()` | `stoolap_rows_fetch_all` bulk buffer | Multi-row results |
 | `queryOne()` | `stoolap_rows_next` cursor (1 step) | Single-row lookups |
-| `queryCursor()` | `stoolap_rows_next` streaming cursor | Large results with bounded memory |
+| `queryCursor()` | `stoolap_rows_fetch_chunk` packed chunks (32 rows, doubling to 256) | Large results with bounded memory |
 
-All parameter binding uses stack allocation for up to 16 params. Batch execution flattens all rows into a shared arena and makes one FFI call. Column names are cached on prepared statements after the first execution.
+Parameter binding copies text and binary values into one arena, on the stack for short parameter lists. Batch execution flattens all rows into a shared arena and makes one FFI call. Prepared statements reuse their column names across calls and re-read them when the schema changes after the prepare.
+
+`Database` and `PreparedStatement` can be shared across threads: calls on one handle are serialized, since the engine keeps each handle's last error on the handle. For parallel queries, open the same DSN once per thread; the opens share one engine. `Transaction` and `RowCursor` belong to the thread that uses them.
 
 ## Building from Source
 
@@ -326,14 +326,18 @@ git clone https://github.com/stoolap/stoolap-swift.git
 cd stoolap-swift
 
 # Build the Rust shared library
-cd crates/stoolap-c
-cargo build --release
-cd ../..
+./scripts/build-rust.sh
 
-# Build and test the Swift package
-swift build
-swift test
+# Build and test the Swift package against the library built above
+STOOLAP_LOCAL_BUILD=1 swift build
+STOOLAP_LOCAL_BUILD=1 swift test
 ```
+
+Without `STOOLAP_LOCAL_BUILD=1`, the package links the prebuilt `StoolapC.xcframework` of the release named in `Package.swift`, which on `main` can be older than the sources; develop and test with the flag set.
+
+## Releasing
+
+Bump `version` in `crates/stoolap-c/Cargo.toml`, then run the **Release** workflow from the Actions tab with that version. It builds `StoolapC.xcframework.zip`, writes its URL and checksum into `Package.swift`, commits that to `main`, tags the commit, and publishes the GitHub release with the same zip.
 
 ## License
 

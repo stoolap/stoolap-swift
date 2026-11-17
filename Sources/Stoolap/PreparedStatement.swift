@@ -14,7 +14,6 @@
 
 import CStoolap
 import Foundation
-import os
 
 /// A prepared SQL statement.
 ///
@@ -25,10 +24,9 @@ public final class PreparedStatement: @unchecked Sendable {
     @usableFromInline
     let handle: OpaquePointer
 
-    /// Lock protecting `_cachedColumnNames`. The cache is write-once
-    /// (nil -> value, never mutated again) so contention is limited to
-    /// the very first query call.
-    private var _lock = os_unfair_lock()
+    /// Serializes calls on `handle` (which keeps the last error) and
+    /// guards `_cachedColumnNames`.
+    private let lock = HandleLock()
 
     init(handle: OpaquePointer) {
         self.handle = handle
@@ -50,14 +48,15 @@ public final class PreparedStatement: @unchecked Sendable {
 
     @discardableResult
     public func execute(_ params: [Value] = []) throws -> Int64 {
-        var affected: Int64 = 0
-        let rc = try ParameterBinder.withBound(params) { ptr, len in
-            stoolap_stmt_exec(handle, ptr, len, &affected)
+        try ParameterBinder.withBound(params) { ptr, len in
+            try lock.withLock {
+                var affected: Int64 = 0
+                if stoolap_stmt_exec(handle, ptr, len, &affected) != STOOLAP_OK {
+                    throw StoolapError.from(stmt: handle)
+                }
+                return affected
+            }
         }
-        if rc != STOOLAP_OK {
-            throw StoolapError.from(stmt: handle)
-        }
-        return affected
     }
 
     // ---- Query ----
@@ -67,7 +66,7 @@ public final class PreparedStatement: @unchecked Sendable {
         defer { stoolap_rows_close(rows) }
         let cached = cachedColumnNames
         let result = try BulkRowReader.drainAsRows(rows, cachedColumns: cached)
-        if cached == nil, let first = result.first {
+        if let first = result.first, first.columns != cached {
             setCachedColumnNames(first.columns)
         }
         return result
@@ -80,7 +79,7 @@ public final class PreparedStatement: @unchecked Sendable {
         let result = try CursorRowReader.readFirstAsRow(
             rows, cachedColumns: cached
         )
-        if cached == nil, let result = result {
+        if let result = result, result.columns != cached {
             setCachedColumnNames(result.columns)
         }
         return result
@@ -91,7 +90,7 @@ public final class PreparedStatement: @unchecked Sendable {
         defer { stoolap_rows_close(rows) }
         let cached = cachedColumnNames
         let result = try BulkRowReader.drainAsColumnar(rows, cachedColumns: cached)
-        if cached == nil, result.rowCount > 0 {
+        if result.columns != cached {
             setCachedColumnNames(result.columns)
         }
         return result
@@ -100,25 +99,21 @@ public final class PreparedStatement: @unchecked Sendable {
     /// Open a streaming cursor over the result set. Use this for large
     /// reads when you want bounded memory instead of bulk materialization.
     public func queryCursor(_ params: [Value] = []) throws -> RowCursor {
-        let rows = try openCursor(params)
-        let cached = cachedColumnNames
-        let cursor = RowCursor(handle: rows, cachedColumns: cached)
-        if cached == nil {
-            setCachedColumnNames(cursor.columns)
-        }
-        return cursor
+        RowCursor(handle: try openCursor(params))
     }
 
     @inline(__always)
     private func openCursor(_ params: [Value]) throws -> OpaquePointer {
-        var raw: OpaquePointer?
-        let rc = try ParameterBinder.withBound(params) { ptr, len in
-            stoolap_stmt_query(handle, ptr, len, &raw)
+        try ParameterBinder.withBound(params) { ptr, len in
+            try lock.withLock {
+                var raw: OpaquePointer?
+                let rc = stoolap_stmt_query(handle, ptr, len, &raw)
+                guard rc == STOOLAP_OK, let raw = raw else {
+                    throw StoolapError.from(stmt: handle)
+                }
+                return raw
+            }
         }
-        guard rc == STOOLAP_OK, let raw = raw else {
-            throw StoolapError.from(stmt: handle)
-        }
-        return raw
     }
 
     // ---- Batch ----
@@ -144,14 +139,21 @@ public final class PreparedStatement: @unchecked Sendable {
             )
         }
 
-        var total: Int64 = 0
-        let rc = try BatchParameterBinder.withBoundBatch(batch) { ptr, paramsPerRow, rowCount in
-            stoolap_stmt_exec_batch(db.handle, handle, ptr, paramsPerRow, rowCount, &total)
+        return try BatchParameterBinder.withBoundBatch(batch) { ptr, paramsPerRow, rowCount in
+            // Lock order: database, then statement.
+            try db.lock.withLock {
+                try lock.withLock {
+                    var total: Int64 = 0
+                    let rc = stoolap_stmt_exec_batch(
+                        db.handle, handle, ptr, paramsPerRow, rowCount, &total
+                    )
+                    if rc != STOOLAP_OK {
+                        throw StoolapError.from(db: db.handle)
+                    }
+                    return total
+                }
+            }
         }
-        if rc != STOOLAP_OK {
-            throw StoolapError.from(db: db.handle)
-        }
-        return total
     }
 
     /// Optional back-reference to the owning Database, set by
@@ -159,27 +161,21 @@ public final class PreparedStatement: @unchecked Sendable {
     @usableFromInline
     var ownerDatabase: Database?
 
-    /// Cached column names from the first successful query. For a
-    /// prepared statement the column set never changes, so reusing the
-    /// same `[String]` avoids N FFI calls + N String allocations on
-    /// every subsequent call. COW means all returned Rows/ColumnarResults
-    /// share the same backing storage. Protected by `_lock`.
+    /// Column names of the latest result. Each result's columns are
+    /// compared against them, and a match reuses the same `[String]`
+    /// instead of allocating N Strings; a mismatch (the schema changed
+    /// after the prepare) replaces them. COW means all returned
+    /// Rows/ColumnarResults share the same backing storage. Protected by
+    /// `lock`.
     private var _cachedColumnNames: [String]?
 
     @inline(__always)
     private var cachedColumnNames: [String]? {
-        os_unfair_lock_lock(&_lock)
-        let v = _cachedColumnNames
-        os_unfair_lock_unlock(&_lock)
-        return v
+        lock.withLock { _cachedColumnNames }
     }
 
     @inline(__always)
     private func setCachedColumnNames(_ names: [String]) {
-        os_unfair_lock_lock(&_lock)
-        if _cachedColumnNames == nil {
-            _cachedColumnNames = names
-        }
-        os_unfair_lock_unlock(&_lock)
+        lock.withLock { _cachedColumnNames = names }
     }
 }

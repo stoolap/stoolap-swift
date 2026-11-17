@@ -26,9 +26,9 @@ public enum Value: Equatable, Hashable, Sendable {
     case float(Double)
     case text(String)
     case boolean(Bool)
-    case timestamp(Date)
+    indirect case timestamp(Date)
     case json(String)
-    case blob(Data)
+    indirect case blob(Data)
     case vector([Float])
 
     @inlinable

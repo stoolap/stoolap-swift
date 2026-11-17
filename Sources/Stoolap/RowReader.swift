@@ -19,20 +19,15 @@ import Foundation
 // Two read paths
 // =============================================================================
 //
-// 1. **Bulk drain (`drainAsDicts`, `drainAsColumnar`)**: calls
-//    `stoolap_rows_fetch_all`, which encodes every remaining row into a
-//    single binary buffer in Rust. Swift decodes the buffer with
-//    `BulkRowDecoder`. Used by `query`/`queryRaw` because per-cell FFI
-//    overhead would otherwise dominate large result sets (`SELECT *`).
+// 1. **Packed buffers (`drainAsRows`, `drainAsColumnar`, `RowCursor`)**:
+//    `stoolap_rows_fetch_all` encodes every remaining row into a single
+//    binary buffer in Rust (`query`/`queryRaw`), and
+//    `stoolap_rows_fetch_chunk` encodes the next chunk (`RowCursor`).
+//    Swift decodes both with `BulkRowDecoder`.
 //
-// 2. **Cursor (`drainFirstAsDict`, public `Cursor` API)**: calls
-//    `stoolap_rows_next` + `stoolap_rows_column_*` per cell. Used by
-//    `queryOne` because it terminates after the first row, and by users
-//    who want to skip dict construction entirely.
-//
-// The bulk path wins for any drain that touches more than ~5 rows because
-// FFI dispatch and StoolapRows lifetime tracking add a fixed cost per
-// `stoolap_rows_next` step.
+// 2. **Cell accessors (`CursorRowReader`)**: `stoolap_rows_next` +
+//    `stoolap_rows_column_*` per cell. Used by `queryOne` because it
+//    terminates after the first row, where it beats packing.
 
 // =============================================================================
 // Bulk drain via stoolap_rows_fetch_all
@@ -59,6 +54,22 @@ enum BulkRowReader {
 
         let raw = UnsafeRawBufferPointer(start: bufPtr, count: Int(bufLen))
         var dec = BulkRowDecoder(bytes: raw)
+        return decode(&dec)
+    }
+
+    /// Decode a packed buffer the engine keeps on the rows handle
+    /// (`stoolap_rows_fetch_chunk`). It is valid only until the next call
+    /// on that handle and is not freed here.
+    @inlinable
+    static func decodeBorrowed<T>(
+        _ buf: UnsafePointer<UInt8>?,
+        _ len: Int64,
+        _ decode: (inout BulkRowDecoder) -> T
+    ) throws -> T {
+        guard let buf = buf, len >= 0 else {
+            throw StoolapError("engine returned no result buffer")
+        }
+        var dec = BulkRowDecoder(bytes: UnsafeRawBufferPointer(start: buf, count: Int(len)))
         return decode(&dec)
     }
 
@@ -244,32 +255,37 @@ struct BulkRowDecoder {
         return columns
     }
 
-    /// Advance past the column-name header without allocating Strings.
-    /// Used when a cached column list is available.
+    /// Read the column-name header, returning `cached` without allocating
+    /// when the header holds the same names. A header that differs (the
+    /// schema changed after a prepare) is decoded into fresh Strings.
     @inlinable
-    @inline(__always)
-    mutating func skipColumnNames() {
-        let colCount = Int(readU32())
-        for _ in 0 ..< colCount {
-            let len = Int(readU16())
-            ptr = ptr.advanced(by: len)
+    mutating func readColumnNames(reusing cached: [String]?) -> [String] {
+        guard let cached = cached else { return readColumnNames() }
+        let start = ptr
+        if Int(readU32()) == cached.count {
+            var same = true
+            for name in cached {
+                let len = Int(readU16())
+                if !utf8Equals(name, ptr, len) {
+                    same = false
+                    break
+                }
+                ptr = ptr.advanced(by: len)
+            }
+            if same { return cached }
         }
+        ptr = start
+        return readColumnNames()
     }
 
     // ---- Result shapes ----
 
     /// Decode into `[Row]` with **a single allocation for all cells**.
-    /// When `cachedColumns` is provided, skips the column-name header
-    /// bytes instead of decoding them into fresh Strings.
+    /// When `cachedColumns` matches the header, reuses it instead of
+    /// decoding the names into fresh Strings.
     @inlinable
     mutating func decodeAsRows(cachedColumns: [String]? = nil) -> [Row] {
-        let columns: [String]
-        if let cached = cachedColumns {
-            skipColumnNames()
-            columns = cached
-        } else {
-            columns = readColumnNames()
-        }
+        let columns = readColumnNames(reusing: cachedColumns)
         let rowCount = Int(readU32())
         let colCount = columns.count
         let cellCount = rowCount * colCount
@@ -296,16 +312,10 @@ struct BulkRowDecoder {
     }
 
     /// Decode into flat `ColumnarResult`.
-    /// When `cachedColumns` is provided, skips the column-name header.
+    /// When `cachedColumns` matches the header, reuses it.
     @inlinable
     mutating func decodeAsColumnar(cachedColumns: [String]? = nil) -> ColumnarResult {
-        let columns: [String]
-        if let cached = cachedColumns {
-            skipColumnNames()
-            columns = cached
-        } else {
-            columns = readColumnNames()
-        }
+        let columns = readColumnNames(reusing: cachedColumns)
         let rowCount = Int(readU32())
         let colCount = columns.count
         let cellCount = rowCount * colCount
@@ -444,7 +454,36 @@ enum CursorRowReader {
         if step != STOOLAP_ROW {
             throw StoolapError.from(rows: rows)
         }
-        let names = cachedColumns ?? readColumnNames(rows)
+        var names: [String]
+        if let cached = cachedColumns, columnsMatch(rows, cached) {
+            names = cached
+        } else {
+            names = readColumnNames(rows)
+        }
         return readCurrentAsRow(rows, cachedColumns: names)
+    }
+
+    /// True when `rows` has exactly the columns `names`, compared without
+    /// allocating (a prepared statement's schema can change after prepare).
+    @inlinable
+    static func columnsMatch(_ rows: OpaquePointer, _ names: [String]) -> Bool {
+        guard Int(stoolap_rows_column_count(rows)) == names.count else { return false }
+        for (i, name) in names.enumerated() {
+            guard let cstr = stoolap_rows_column_name(rows, Int32(i)) else { return false }
+            let len = strlen(cstr)
+            let bytes = UnsafeRawPointer(cstr).assumingMemoryBound(to: UInt8.self)
+            if !utf8Equals(name, bytes, len) { return false }
+        }
+        return true
+    }
+}
+
+/// True when `name`'s UTF-8 bytes equal the `len` bytes at `bytes`.
+@inlinable
+@inline(__always)
+func utf8Equals(_ name: String, _ bytes: UnsafePointer<UInt8>, _ len: Int) -> Bool {
+    var name = name
+    return name.withUTF8 { utf8 in
+        utf8.count == len && (len == 0 || memcmp(utf8.baseAddress!, bytes, len) == 0)
     }
 }

@@ -21,7 +21,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CRATE_DIR="$ROOT_DIR/crates/stoolap-c"
-HEADERS="$ROOT_DIR/Sources/CStoolap/include"
 OUTPUT="$ROOT_DIR/StoolapC.xcframework"
 TMP_DIR="$(mktemp -d)"
 
@@ -45,27 +44,50 @@ for target in "${TARGETS[@]}"; do
 done
 
 # 2. Create universal (fat) libraries
+# Strip local symbols, as the dylib builds do.
+for target in "${TARGETS[@]}"; do
+  strip -x "$CRATE_DIR/target/$target/release/libstoolap_c.a"
+done
+
+# Headers plus a module map, so `import CStoolap` resolves against the
+# xcframework when Package.swift uses it as a binary target. They sit in a
+# CStoolap/ subdirectory so an app linking other static xcframeworks gets
+# no clashing Headers/module.modulemap.
+HEADERS="$TMP_DIR/headers"
+mkdir -p "$HEADERS/CStoolap"
+cp "$ROOT_DIR/Sources/CStoolap/include/stoolap.h" "$HEADERS/CStoolap/"
+cat > "$HEADERS/CStoolap/module.modulemap" <<'MODULEMAP'
+module CStoolap {
+    header "stoolap.h"
+    export *
+}
+MODULEMAP
+
+# SwiftPM links an xcframework's static library as -l<name>, so each
+# slice keeps the name libstoolap_c.a.
+mkdir -p "$TMP_DIR/macos" "$TMP_DIR/ios-sim"
+
 echo "==> Creating macOS universal binary"
 lipo -create \
   "$CRATE_DIR/target/aarch64-apple-darwin/release/libstoolap_c.a" \
   "$CRATE_DIR/target/x86_64-apple-darwin/release/libstoolap_c.a" \
-  -output "$TMP_DIR/macos-libstoolap_c.a"
+  -output "$TMP_DIR/macos/libstoolap_c.a"
 
 echo "==> Creating iOS simulator universal binary"
 lipo -create \
   "$CRATE_DIR/target/aarch64-apple-ios-sim/release/libstoolap_c.a" \
   "$CRATE_DIR/target/x86_64-apple-ios/release/libstoolap_c.a" \
-  -output "$TMP_DIR/ios-sim-libstoolap_c.a"
+  -output "$TMP_DIR/ios-sim/libstoolap_c.a"
 
 # 3. Assemble xcframework
 echo "==> Creating xcframework"
 rm -rf "$OUTPUT"
 xcodebuild -create-xcframework \
-  -library "$TMP_DIR/macos-libstoolap_c.a" \
+  -library "$TMP_DIR/macos/libstoolap_c.a" \
   -headers "$HEADERS" \
   -library "$CRATE_DIR/target/aarch64-apple-ios/release/libstoolap_c.a" \
   -headers "$HEADERS" \
-  -library "$TMP_DIR/ios-sim-libstoolap_c.a" \
+  -library "$TMP_DIR/ios-sim/libstoolap_c.a" \
   -headers "$HEADERS" \
   -output "$OUTPUT"
 

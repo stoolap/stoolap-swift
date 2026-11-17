@@ -15,13 +15,29 @@
 
 import PackageDescription
 
-// Resolve the absolute path to the Rust build artifacts so SPM can link
-// against the cdylib produced by `scripts/build-rust.sh`.
-//
-// The Rust crate lives at `crates/stoolap-c/` and emits its dylib into
-// `crates/stoolap-c/target/release/`. We pass that directory to the linker
-// via `unsafeFlags` and link `-lstoolap_c`.
+// Consumers link the prebuilt StoolapC.xcframework (static engine library
+// for macOS and iOS) attached to each GitHub release. The release workflow
+// rewrites `engineURL` and `engineChecksum` when it publishes a version.
+let engineURL = "https://github.com/stoolap/stoolap-swift/releases/download/v0.5.0/StoolapC.xcframework.zip"
+let engineChecksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+// Development builds the engine from source instead: run
+// `scripts/build-rust.sh`, then build with STOOLAP_LOCAL_BUILD=1. That
+// links the cdylib in crates/stoolap-c/target/release.
+let localBuild = Context.environment["STOOLAP_LOCAL_BUILD"] == "1"
 let rustReleaseDir = "\(Context.packageDirectory)/crates/stoolap-c/target/release"
+
+let engineTarget: Target = localBuild
+    // C interop module exposing the hand-written stoolap.h header.
+    ? .systemLibrary(name: "CStoolap", path: "Sources/CStoolap")
+    : .binaryTarget(name: "CStoolap", url: engineURL, checksum: engineChecksum)
+
+let engineLinkerSettings: [LinkerSetting] = localBuild
+    ? [.unsafeFlags(["-L", rustReleaseDir, "-lstoolap_c",
+                     "-Xlinker", "-rpath", "-Xlinker", rustReleaseDir])]
+    // The system libraries the static Rust library needs
+    // (`cargo rustc -- --print native-static-libs`).
+    : [.linkedFramework("CoreFoundation"), .linkedLibrary("iconv")]
 
 let package = Package(
     name: "Stoolap",
@@ -36,25 +52,13 @@ let package = Package(
         ),
     ],
     targets: [
-        // C interop module exposing the hand-written stoolap.h header.
-        .systemLibrary(
-            name: "CStoolap",
-            path: "Sources/CStoolap"
-        ),
+        engineTarget,
 
-        // Swift driver. Links against the Rust cdylib (libstoolap_c.dylib)
-        // built into crates/stoolap-c/target/release/ by scripts/build-rust.sh.
+        // Swift driver over the engine's C ABI.
         .target(
             name: "Stoolap",
             dependencies: ["CStoolap"],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-L", rustReleaseDir,
-                    "-lstoolap_c",
-                    "-Xlinker", "-rpath",
-                    "-Xlinker", rustReleaseDir,
-                ])
-            ]
+            linkerSettings: engineLinkerSettings
         ),
 
         .testTarget(

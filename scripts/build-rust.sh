@@ -29,6 +29,11 @@ else
     OUT_DIR="$CRATE_DIR/target/debug"
 fi
 
+# Cargo records the dylib's install name as an absolute path into
+# target/*/build/<hash>/out/, which goes stale on the next rebuild. Use
+# @rpath (as CI does) so Swift binaries load the dylib in $OUT_DIR.
+install_name_tool -id @rpath/libstoolap_c.dylib "$OUT_DIR/libstoolap_c.dylib"
+
 echo "==> Built artifacts:"
 ls -lh "$OUT_DIR" | grep -E 'libstoolap_c\.(dylib|a)' || true
 
