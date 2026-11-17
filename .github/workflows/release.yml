@@ -1,86 +1,28 @@
 name: Release
 
+# Run from the Actions tab with the version to publish (e.g. 0.5.0).
+#
+# Package.swift must name the checksum of the exact StoolapC.xcframework.zip
+# attached to the release, and the build is not byte-reproducible, so this
+# workflow builds the zip once, writes its URL and checksum into
+# Package.swift and commits that to main, creates a draft release of that
+# commit with the same zip, and only then publishes it, which creates the
+# tag v<version>. A run that fails before publishing leaves no tag; delete
+# its draft release (if any) and dispatch again.
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without the leading v (e.g. 0.5.0)
+        required: true
 
 permissions:
   contents: write
 
-env:
-  STOOLAP_ENGINE_REF: v0.4.2
-
 jobs:
-  build-lib:
-    strategy:
-      fail-fast: true
-      matrix:
-        settings:
-          - host: macos-14
-            target: aarch64-apple-darwin
-          - host: macos-14
-            target: x86_64-apple-darwin
-          - host: macos-14
-            target: aarch64-apple-ios
-          - host: macos-14
-            target: aarch64-apple-ios-sim
-          - host: macos-14
-            target: x86_64-apple-ios
-
-    name: Build - ${{ matrix.settings.target }}
-    runs-on: ${{ matrix.settings.host }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Clone stoolap engine
-        run: git clone --depth 1 --branch ${{ env.STOOLAP_ENGINE_REF }} https://github.com/stoolap/stoolap.git stoolap-engine
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.settings.target }}
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/stoolap-c
-          key: ${{ matrix.settings.target }}
-
-      - name: Build stoolap-c
-        working-directory: crates/stoolap-c
-        run: cargo build --release --target ${{ matrix.settings.target }}
-
-      - name: Strip static library
-        run: strip -x crates/stoolap-c/target/${{ matrix.settings.target }}/release/libstoolap_c.a
-
-      - name: Upload static library
-        uses: actions/upload-artifact@v4
-        with:
-          name: lib-${{ matrix.settings.target }}
-          path: crates/stoolap-c/target/${{ matrix.settings.target }}/release/libstoolap_c.a
-          if-no-files-found: error
-
-      # Also upload dylib for macOS targets (used by swift build/test)
-      - name: Fix macOS install name
-        if: contains(matrix.settings.target, 'darwin')
-        run: install_name_tool -id @rpath/libstoolap_c.dylib crates/stoolap-c/target/${{ matrix.settings.target }}/release/libstoolap_c.dylib
-
-      - name: Strip shared library
-        if: contains(matrix.settings.target, 'darwin')
-        run: strip -x crates/stoolap-c/target/${{ matrix.settings.target }}/release/libstoolap_c.dylib
-
-      - name: Upload shared library
-        if: contains(matrix.settings.target, 'darwin')
-        uses: actions/upload-artifact@v4
-        with:
-          name: dylib-${{ matrix.settings.target }}
-          path: crates/stoolap-c/target/${{ matrix.settings.target }}/release/libstoolap_c.dylib
-          if-no-files-found: error
-
   test:
+    if: github.ref == 'refs/heads/main'
     name: Test - Swift ${{ matrix.swift }} (${{ matrix.os }})
-    needs: build-lib
     strategy:
       fail-fast: true
       matrix:
@@ -93,137 +35,152 @@ jobs:
             os: macos-15
 
     runs-on: ${{ matrix.os }}
+    env:
+      STOOLAP_LOCAL_BUILD: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Setup Swift
         uses: swift-actions/setup-swift@v2
         with:
           swift-version: ${{ matrix.swift }}
 
-      - name: Download shared library
-        uses: actions/download-artifact@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          name: dylib-aarch64-apple-darwin
-          path: lib
+          workspaces: crates/stoolap-c
 
-      - name: Configure library path
-        run: |
-          echo "LD_LIBRARY_PATH=${{ github.workspace }}/lib" >> $GITHUB_ENV
-          echo "DYLD_LIBRARY_PATH=${{ github.workspace }}/lib" >> $GITHUB_ENV
-          echo "LIBRARY_PATH=${{ github.workspace }}/lib" >> $GITHUB_ENV
-
-      - name: Build
-        run: swift build
+      - name: Build stoolap-c
+        run: ./scripts/build-rust.sh
 
       - name: Test
         run: swift test
 
-  xcframework:
-    name: Build XCFramework
-    needs: build-lib
-    runs-on: macos-14
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download all static libraries
-        uses: actions/download-artifact@v4
-        with:
-          pattern: lib-*
-          path: libs
-
-      - name: Create fat libraries
-        run: |
-          mkdir -p fat/macos fat/ios-sim
-
-          # macOS universal (arm64 + x86_64)
-          lipo -create \
-            libs/lib-aarch64-apple-darwin/libstoolap_c.a \
-            libs/lib-x86_64-apple-darwin/libstoolap_c.a \
-            -output fat/macos/libstoolap_c.a
-
-          # iOS simulator universal (arm64 + x86_64)
-          lipo -create \
-            libs/lib-aarch64-apple-ios-sim/libstoolap_c.a \
-            libs/lib-x86_64-apple-ios/libstoolap_c.a \
-            -output fat/ios-sim/libstoolap_c.a
-
-      - name: Assemble XCFramework
-        run: |
-          xcodebuild -create-xcframework \
-            -library fat/macos/libstoolap_c.a \
-            -headers Sources/CStoolap/include \
-            -library libs/lib-aarch64-apple-ios/libstoolap_c.a \
-            -headers Sources/CStoolap/include \
-            -library fat/ios-sim/libstoolap_c.a \
-            -headers Sources/CStoolap/include \
-            -output StoolapC.xcframework
-
-      - name: Zip XCFramework
-        run: zip -r StoolapC.xcframework.zip StoolapC.xcframework
-
-      - name: Compute checksum
-        id: checksum
-        run: echo "sha256=$(shasum -a 256 StoolapC.xcframework.zip | awk '{print $1}')" >> $GITHUB_OUTPUT
-
-      - name: Upload XCFramework artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: StoolapC-xcframework
-          path: StoolapC.xcframework.zip
-          if-no-files-found: error
-
-    outputs:
-      checksum: ${{ steps.checksum.outputs.sha256 }}
-
   release:
-    name: Create GitHub Release
-    needs: [build-lib, test, xcframework]
-    runs-on: ubuntu-latest
+    name: Build XCFramework and publish v${{ inputs.version }}
+    needs: test
+    runs-on: macos-14
+    env:
+      VERSION: ${{ inputs.version }}
     steps:
+      # The commit the test job tested. Pushing the release commit fails if
+      # main has moved since.
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Download aarch64 dylib
-        uses: actions/download-artifact@v4
-        with:
-          name: dylib-aarch64-apple-darwin
-          path: artifacts/aarch64
-
-      - name: Download x86_64 dylib
-        uses: actions/download-artifact@v4
-        with:
-          name: dylib-x86_64-apple-darwin
-          path: artifacts/x86_64
-
-      - name: Download XCFramework
-        uses: actions/download-artifact@v4
-        with:
-          name: StoolapC-xcframework
-          path: artifacts
-
-      - name: Prepare release assets
+      - name: Check version
         run: |
-          mv artifacts/aarch64/libstoolap_c.dylib artifacts/libstoolap_c-darwin-arm64.dylib
-          mv artifacts/x86_64/libstoolap_c.dylib artifacts/libstoolap_c-darwin-x64.dylib
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$VERSION' is not a version like 0.5.0"; exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::tag v$VERSION already exists"; exit 1
+          fi
+          grep -q "version = \"$VERSION\"" crates/stoolap-c/Cargo.toml \
+            || { echo "::error::crates/stoolap-c/Cargo.toml is not at $VERSION"; exit 1; }
 
-      - name: Create GitHub Release
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/stoolap-c
+
+      - name: Build XCFramework
+        run: ./scripts/build-xcframework.sh
+
+      # build-for-testing links the test bundle, so the static library's
+      # symbols are resolved for each iOS slice.
+      - name: Link for iOS Simulator and iOS devices against the XCFramework
+        run: |
+          sed -i '' 's#\.binaryTarget(name: "CStoolap", url: engineURL, checksum: engineChecksum)#.binaryTarget(name: "CStoolap", path: "StoolapC.xcframework")#' Package.swift
+          grep -q 'path: "StoolapC.xcframework"' Package.swift
+          for destination in 'generic/platform=iOS Simulator' 'generic/platform=iOS'; do
+            xcodebuild build-for-testing -scheme Stoolap -destination "$destination" \
+              -derivedDataPath .dd CODE_SIGNING_ALLOWED=NO
+          done
+          git checkout -- Package.swift
+
+      - name: Test on macOS against the XCFramework
+        run: |
+          sed -i '' 's#\.binaryTarget(name: "CStoolap", url: engineURL, checksum: engineChecksum)#.binaryTarget(name: "CStoolap", path: "StoolapC.xcframework")#' Package.swift
+          swift test
+          git checkout -- Package.swift
+
+      - name: Zip XCFramework and compute checksum
+        id: zip
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent StoolapC.xcframework StoolapC.xcframework.zip
+          echo "checksum=$(swift package compute-checksum StoolapC.xcframework.zip)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare dylib assets
+        run: |
+          mkdir -p assets
+          for pair in aarch64-apple-darwin:arm64 x86_64-apple-darwin:x64; do
+            target="${pair%%:*}"; arch="${pair##*:}"
+            out="assets/libstoolap_c-darwin-$arch.dylib"
+            cp "crates/stoolap-c/target/$target/release/libstoolap_c.dylib" "$out"
+            install_name_tool -id @rpath/libstoolap_c.dylib "$out"
+            strip -x "$out"
+          done
+          mv StoolapC.xcframework.zip assets/
+
+      - name: Write the XCFramework URL and checksum into Package.swift
+        env:
+          CHECKSUM: ${{ steps.zip.outputs.checksum }}
+        run: |
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v$VERSION/StoolapC.xcframework.zip"
+          sed -i '' -E \
+            -e "s#^let engineURL = \".*\"#let engineURL = \"$URL\"#" \
+            -e "s#^let engineChecksum = \".*\"#let engineChecksum = \"$CHECKSUM\"#" \
+            Package.swift
+          grep -q "$CHECKSUM" Package.swift
+          grep -q "$URL" Package.swift
+
+      - name: Commit and push to main
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release v$VERSION: point Package.swift at the v$VERSION XCFramework"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ inputs.version }}
+          target_commitish: ${{ steps.commit.outputs.sha }}
+          draft: true
           generate_release_notes: true
+          prerelease: ${{ contains(inputs.version, '-') }}
           body: |
             ### XCFramework (iOS + macOS)
 
             ```
-            SHA-256: ${{ needs.xcframework.outputs.checksum }}
+            SHA-256: ${{ steps.zip.outputs.checksum }}
             ```
 
             Platforms: macOS (arm64, x86_64), iOS (arm64), iOS Simulator (arm64, x86_64)
           files: |
-            artifacts/libstoolap_c-darwin-arm64.dylib
-            artifacts/libstoolap_c-darwin-x64.dylib
-            artifacts/StoolapC.xcframework.zip
+            assets/libstoolap_c-darwin-arm64.dylib
+            assets/libstoolap_c-darwin-x64.dylib
+            assets/StoolapC.xcframework.zip
+
+      # Publishing creates the tag, after the zip is attached.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "v$VERSION" --draft=false
