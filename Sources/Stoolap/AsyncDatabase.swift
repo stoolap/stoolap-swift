@@ -16,9 +16,9 @@ import Foundation
 
 /// Async wrapper around `Database`.
 ///
-/// Stoolap's underlying API is synchronous; this wrapper hops calls onto a
-/// detached task so they do not block the Swift cooperative thread pool.
-/// `Database` itself is `@unchecked Sendable`, so it can be safely captured
+/// Stoolap's underlying API is synchronous; this wrapper runs each call in
+/// a detached task, off the calling actor. The task still occupies a
+/// thread of the cooperative pool while the engine works. `Database` itself is `@unchecked Sendable`, so it can be safely captured
 /// across the suspension point.
 public actor AsyncDatabase {
     public let db: Database

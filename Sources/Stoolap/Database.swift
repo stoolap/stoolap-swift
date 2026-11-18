@@ -18,9 +18,10 @@ import Foundation
 /// A Stoolap database connection.
 ///
 /// `Database` wraps an opaque `StoolapDB*` handle from the upstream
-/// `stoolap::ffi` module. It is safe to share across threads (the
-/// underlying type uses interior locking), but `Transaction` instances
-/// returned from `begin()` must be used by at most one thread at a time.
+/// `stoolap::ffi` module. It is safe to share across threads: calls on
+/// one `Database` are serialized, because the handle keeps the last
+/// error. `Transaction` instances returned from `begin()` must be used by
+/// at most one thread at a time.
 public final class Database: @unchecked Sendable {
     @usableFromInline
     let handle: OpaquePointer
