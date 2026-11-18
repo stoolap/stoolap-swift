@@ -58,7 +58,7 @@ jobs:
         run: ./scripts/build-rust.sh
 
       - name: Test
-        run: swift test
+        run: swift test --disable-swift-testing
 
   release:
     name: Build XCFramework and publish v${{ inputs.version }}
@@ -114,7 +114,7 @@ jobs:
       - name: Test on macOS against the XCFramework
         run: |
           sed -i '' 's#\.binaryTarget(name: "CStoolap", url: engineURL, checksum: engineChecksum)#.binaryTarget(name: "CStoolap", path: "StoolapC.xcframework")#' Package.swift
-          swift test
+          swift test --disable-swift-testing
           git checkout -- Package.swift
 
       - name: Zip XCFramework and compute checksum
