@@ -19,7 +19,7 @@ import PackageDescription
 // for macOS and iOS) attached to each GitHub release. The release workflow
 // rewrites `engineURL` and `engineChecksum` when it publishes a version.
 let engineURL = "https://github.com/stoolap/stoolap-swift/releases/download/v0.5.0/StoolapC.xcframework.zip"
-let engineChecksum = "0000000000000000000000000000000000000000000000000000000000000000"
+let engineChecksum = "6ae8929556aa35ee687cebad8485465378cf2c76db8a6255f5fd4057ba20db3a"
 
 // Development builds the engine from source instead: run
 // `scripts/build-rust.sh`, then build with STOOLAP_LOCAL_BUILD=1. That
