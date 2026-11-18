@@ -318,7 +318,7 @@ Parameter binding copies text and binary values into one arena, on the stack for
 
 Requires:
 - [Rust](https://rustup.rs) (stable)
-- [Swift](https://swift.org/download/) 5.9+
+- [Swift](https://swift.org/download/) 6.0+
 - macOS 12+ or iOS 15+
 
 ```bash
