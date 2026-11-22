@@ -99,15 +99,28 @@ jobs:
       - name: Build XCFramework
         run: ./scripts/build-xcframework.sh
 
-      # build-for-testing links the test bundle, so the static library's
-      # symbols are resolved for each iOS slice.
+      # Building the tests links the test bundle, so the static library's
+      # symbols are resolved for each iOS slice. SwiftPM cross-builds
+      # directly: xcodebuild's generated package schemes went missing on
+      # the macos-15 image of 2026-11-18.
       - name: Link for iOS Simulator and iOS devices against the XCFramework
         run: |
           sed -i '' 's#\.binaryTarget(name: "CStoolap", url: engineURL, checksum: engineChecksum)#.binaryTarget(name: "CStoolap", path: "StoolapC.xcframework")#' Package.swift
           grep -q 'path: "StoolapC.xcframework"' Package.swift
-          for destination in 'generic/platform=iOS Simulator' 'generic/platform=iOS'; do
-            xcodebuild build-for-testing -scheme Stoolap -destination "$destination" \
-              -derivedDataPath .dd CODE_SIGNING_ALLOWED=NO
+          for pair in arm64-apple-ios15.0:iphoneos \
+                      arm64-apple-ios15.0-simulator:iphonesimulator \
+                      x86_64-apple-ios15.0-simulator:iphonesimulator; do
+            triple="${pair%%:*}"; sdk="${pair##*:}"
+            platform="$(xcrun --sdk "$sdk" --show-sdk-platform-path)/Developer"
+            swift build --build-tests --scratch-path ".build-ios/$triple" \
+              --triple "$triple" --sdk "$(xcrun --sdk "$sdk" --show-sdk-path)" \
+              -Xswiftc -F -Xswiftc "$platform/Library/Frameworks" \
+              -Xswiftc -I -Xswiftc "$platform/usr/lib" \
+              -Xlinker -F -Xlinker "$platform/Library/Frameworks" \
+              -Xlinker -L -Xlinker "$platform/usr/lib"
+            bundle="$(find ".build-ios/$triple" -path '*.xctest/*' -type f \( -name StoolapPackageTests -o -name StoolapTests \) | head -1)"
+            [ -n "$bundle" ] && nm "$bundle" | grep -q ' T _stoolap_open$' \
+              || { echo "::error::$triple test bundle does not contain the engine"; exit 1; }
           done
           git checkout -- Package.swift
 
